@@ -1,4 +1,4 @@
-# AGENTS.md — архитектура ContextAutodetect_OCV2
+# AGENTS.md — архитектура OpenCode_ContextFetcher
 
 ## Назначение
 

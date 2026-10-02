@@ -1,4 +1,4 @@
-# ContextAutodetect_OCV2
+# OpenCode_ContextFetcher
 
 > Плагин для OpenCode V2: динамически определяет контекст локального
 > llama.cpp / llama-swap сервера и прописывает его в `limit.context` модели.
@@ -41,7 +41,7 @@ OpenAI-совместимых провайдеров, поэтому плаги�
 ## Структура
 
 ```
-ContextAutodetect_OCV2/
+OpenCode_ContextFetcher/
 ├── opencode.json          # тестовый конфиг проекта (LocalAI + plugins:["./plugin"], без limit)
 ├── install.bat            # установка плагина в глобальный каталог OpenCode (Windows)
 ├── plugin/
@@ -66,7 +66,7 @@ ContextAutodetect_OCV2/
 
 ```text
 Установи мне плагин OpenCode V2 для автоопределения контекста из репозитория
-https://github.com/StandarterDF/ContextAutodetect_OCV2 (замени URL на свой форк,
+https://github.com/StandarterDF/OpenCode_ContextFetcher (замени URL на свой форк,
 если он у тебя другой).
 
 Что нужно сделать:
@@ -76,7 +76,7 @@ https://github.com/StandarterDF/ContextAutodetect_OCV2 (замени URL на с
    Каталог глобальных плагинов — <config>/plugins/.
 2. Установи плагин одним из способов (предпочтительно через CLI, он сам
    пропишет плагин в конфиг):
-   - выполни: opencode plugin add github:StandarterDF/ContextAutodetect_OCV2#main::path:plugin
+   - выполни: opencode plugin add github:StandarterDF/OpenCode_ContextFetcher#main::path:plugin
    - если CLI недоступен или репозиторий ещё не опубликован, скопируй содержимое
      папки plugin/ репозитория (файлы index.js и package.json) в
      <config>/plugins/localai-context/.
@@ -106,7 +106,7 @@ https://github.com/StandarterDF/ContextAutodetect_OCV2 (замени URL на с
 Если репозиторий уже опубликован на GitHub:
 
 ```bash
-opencode plugin add 'github:StandarterDF/ContextAutodetect_OCV2#main::path:plugin'
+opencode plugin add 'github:StandarterDF/OpenCode_ContextFetcher#main::path:plugin'
 ```
 
 CLI сам скачает пакет, установит его и добавит запись в глобальный конфиг.
@@ -215,7 +215,7 @@ OpenCode».
 
 ```bash
 opencode plugin update            # обновить все плагины
-opencode plugin update ContextAutodetect_OCV2
+opencode plugin update opencode-localai-dynamic-context
 ```
 
 Для ручной установки (варианты 3–4) просто замени `index.js` на новую версию и
