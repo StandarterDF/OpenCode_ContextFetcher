@@ -1,47 +1,58 @@
-# OpenCode_ContextFetcher
+# OpenCode_LocalAI
 
-> Плагин для OpenCode V2: динамически определяет контекст локального
-> llama.cpp / llama-swap сервера и прописывает его в `limit.context` модели.
+> Плагин для OpenCode V2: сам подтягивает список моделей с локального
+> llama.cpp / llama-swap сервера и прописывает их контекст.
 
 ## Описание
 
-OpenCode не умеет автоопределять контекст для кастомных
-OpenAI-совместимых провайдеров, поэтому плагин читает `/v1/models`
-(llama.cpp отдаёт `meta.n_ctx`) и обновляет лимит контекста модели прямо во
-время работы.
+OpenCode умеет автоопнаруживать модели только у Ollama, LM Studio и vLLM. Для
+остальных OpenAI-совместимых провайдеров (в том числе для роутера
+llama-swap на llama.cpp) модели нужно перечислять в `opencode.json` вручную, и
+при каждом добавлении или смене модели на сервере правь конфиг.
 
-**Возможности:**
+Плагин снимает эту ручную работу:
 
-- автоопределение `limit.context` для локального OpenAI-совместимого сервера
-  (llama.cpp, llama-swap, vLLM, LM Studio);
-- порядок источников контекста: `meta.n_ctx` → `context_length` →
-  `max_model_len` → `meta.n_ctx_train` → `details.context_length`;
-- периодическая перепроверка (по умолчанию раз в 30 секунд) и
-  `ctx.model.reload()` при смене модели на сервере — без перезапуска OpenCode;
-- без внешних зависимостей — чистый JS (только встроенные средства Node.js);
-- необязательный отладочный лог через переменную окружения
-  `LOCALAI_CONTEXT_DEBUG`.
+- опрашивает `<baseURL>/v1/models` и публикует ответ в реестр провайдера через
+  `ctx.provider.transform` → `editor.models.set(...)`;
+- берёт `limit.context` из того, что отдаёт сервер: явные поля
+  (`context_length`, `max_model_len`, `meta.n_ctx`, …), затем флаги запуска
+  llama-swap (`status.args` → `--ctx-size`) и его preset-файл
+  (`status.preset` → `ctx-size = …`);
+- перечитывает список каждые 30 секунд и при изменении вызывает
+  `ctx.provider.reload()` — переключение моделей в роутере подхватывается без
+  перезапуска OpenCode;
+- задаёт `capabilities.input/output` из `architecture.input_modalities`;
+- не ходит в сеть, кроме опроса самого локального сервера;
+- без внешних зависимостей — чистый JS.
 
-## ⚠️ Главное правило
+Модели в роутере больше не нужно описывать в конфиге: блок `models` у
+провайдера можно удалить целиком.
 
-Если у модели в `opencode.json` **явно прописан `limit.context`**, он
-**перебивает** плагин. Поэтому для моделей, которыми должен управлять плагин,
-`limit` в конфиге нужно **не задавать**.
+## Что НЕ поддерживается из коробки
+
+| Runtime | Автообнаружение в OpenCode | Твой роутер |
+|---|---|---|
+| Ollama | есть, `GET /api/tags` | 404 |
+| LM Studio | есть, `GET /api/v1/models` | 404 |
+| vLLM | есть, `GET /health` + `/v1/models`, фильтр `owned_by == "vllm"` | `/health` и `/v1/models` отвечают, но `owned_by` у всех моделей `llamacpp` — не подходит |
+
+LM Studio и llama.cpp используют один и тот же движок инференса, но **разные
+HTTP-интерфейсы**: у LM Studio свой нативный REST API (`/api/v1/*`), а
+llama.cpp/llama-swap — OpenAI-совместимый (`/v1/*`). Поэтому встроенный
+discovery для LM Studio к llama.cpp не подходит.
 
 ## Требования
 
 - OpenCode **V2**.
 - Node.js **18+** (нужен глобальный `fetch`; в OpenCode уже есть).
-- Локальный OpenAI-совместимый сервер, отдающий список моделей с метаданными
-  контекста (например, llama.cpp / llama-swap).
-- Windows, Linux или macOS. Инструкции с `install.bat` — только для Windows,
-  остальные способы кроссплатформенные.
+- Локальный OpenAI-совместимый сервер, отдающий `/v1/models`
+  (llama.cpp, llama-swap, vLLM, LM Studio, Ollama через прокси).
 
 ## Структура
 
 ```
-OpenCode_ContextFetcher/
-├── opencode.json          # тестовый конфиг проекта (LocalAI + plugins:["./plugin"], без limit)
+LocalAI_OCV2/
+├── opencode.json          # проектный конфиг (только $schema)
 ├── install.bat            # установка плагина в глобальный каталог OpenCode (Windows)
 ├── plugin/
 │   ├── index.js           # сам плагин (чистый JS, без внешних зависимостей)
@@ -54,68 +65,9 @@ OpenCode_ContextFetcher/
 
 ## Установка
 
-Способы ниже равнозначны — выбери любой. Для всех вариантов действует одно
-правило: у управляемой модели `LocalAI/Qwen3-Coder` в `opencode.json` не
-должно быть `limit.context`.
+Способы ниже равнозначны — выбери любой.
 
-### Вариант 1. Автоматически, силами нейросети (рекомендуется)
-
-Скопируй промт ниже и отправь его OpenCode. Агент сам скачает плагин,
-установит его, поправит конфиг, перезапустит сервис и проверит результат.
-
-```text
-Установи мне плагин OpenCode V2 для автоопределения контекста из репозитория
-https://github.com/StandarterDF/OpenCode_ContextFetcher (замени URL на свой форк,
-если он у тебя другой).
-
-Что нужно сделать:
-1. Определи каталог глобального конфига OpenCode:
-   - Windows: %USERPROFILE%\.config\opencode  (или %XDG_CONFIG_HOME%\opencode)
-   - Linux/macOS: ~/.config/opencode  (или $XDG_CONFIG_HOME/opencode)
-   Каталог глобальных плагинов — <config>/plugins/.
-2. Установи плагин одним из способов (предпочтительно через CLI, он сам
-   пропишет плагин в конфиг):
-   - выполни: opencode plugin add github:StandarterDF/OpenCode_ContextFetcher#main::path:plugin
-   - если CLI недоступен или репозиторий ещё не опубликован, скопируй содержимое
-     папки plugin/ репозитория (файлы index.js и package.json) в
-     <config>/plugins/localai-context/.
-3. Открой глобальный <config>/opencode.json. Найди провайдера LocalAI и модель
-   Qwen3-Coder. Убедись, что у модели НЕ задан "limit.context" (и вообще "limit").
-   Если задан — удали его, иначе он перебьёт плагин.
-4. Проверь, что baseURL провайдера LocalAI совпадает с твоим сервером. Если он
-   отличается от http://192.168.0.124:8080/v1, поправь переменную
-   FALLBACK_BASE_URL в <config>/plugins/localai-context/index.js (или оставь —
-   плагин берёт baseURL из настроек провайдера, а fallback нужен только на случай
-   недоступности конфига).
-5. Перезапусти сервис: opencode service restart
-6. Проверь работу: выставь переменную окружения LOCALAI_CONTEXT_DEBUG в путь к
-   лог-файлу, выполни opencode run --agent build "reply with OK" и покажи мне
-   строки из лога вида:
-   [dynamic-context] detected Qwen3-Coder=...
-   [dynamic-context] applied limit.context=... to LocalAI/Qwen3-Coder
-   Если контекст не подхватился — продиагностируй причину и доведи установку до
-   конца.
-
-Действуй автономно, лишних вопросов не задавай. В конце кратко отчитайся: что
-установил, какие файлы изменил, какой контекст определился.
-```
-
-### Вариант 2. Одной командой через CLI
-
-Если репозиторий уже опубликован на GitHub:
-
-```bash
-opencode plugin add 'github:StandarterDF/OpenCode_ContextFetcher#main::path:plugin'
-```
-
-CLI сам скачает пакет, установит его и добавит запись в глобальный конфиг.
-После этого не забудь удалить `limit.context` у модели и перезапустить сервис:
-
-```bash
-opencode service restart
-```
-
-### Вариант 3. Вручную (Windows)
+### Вариант 1. Вручную (Windows)
 
 Запусти из корня репозитория:
 
@@ -124,27 +76,26 @@ install.bat
 ```
 
 Скрипт скопирует `plugin/` в
-`%USERPROFILE%\.config\opencode\plugins\localai-context\`.
+`%USERPROFILE%\.config\opencode\plugins\localai-discovery\` и удалит
+устаревший `localai-context`.
 
-Вручную то же самое — просто скопировать два файла:
+Для Linux / macOS глобальный путь — `~/.config/opencode/plugins/localai-discovery/`.
 
+### Вариант 2. Одной командой через CLI
+
+```bash
+opencode plugin add 'github:StandarterDF/OpenCode_LocalAI#main::path:plugin'
+opencode service restart
 ```
-plugin\index.js       →  %USERPROFILE%\.config\opencode\plugins\localai-context\index.js
-plugin\package.json   →  %USERPROFILE%\.config\opencode\plugins\localai-context\package.json
-```
 
-Для Linux / macOS глобальный путь — `~/.config/opencode/plugins/localai-context/`.
+### Вариант 3. Только для одного проекта
 
-### Вариант 4. Только для одного проекта
-
-Положи плагин в проект и подключи его проектной конфигурацией:
-
-- создай `<project>/.opencode/plugins/localai-context/` с файлами `index.js` и
-  `package.json` — OpenCode подхватит такой каталог автоматически;
+- положи плагин в `<project>/.opencode/plugins/localai-discovery/` (файлы
+  `index.js` и `package.json`) — OpenCode подхватит каталог автоматически;
 
   **или**
 
-- положи каталог рядом и укажи его явно в `<project>/opencode.json`:
+- укажи каталог явно в `<project>/opencode.json`:
 
   ```jsonc
   {
@@ -153,85 +104,111 @@ plugin\package.json   →  %USERPROFILE%\.config\opencode\plugins\localai-contex
   }
   ```
 
-После установки удали `limit.context` у модели `LocalAI/Qwen3-Coder` и
-перезапусти сервис: `opencode service restart`.
-
 ## Настройка
+
+### Провайдер
+
+Плагин ведёт провайдера `LocalAI`. В глобальном конфиге у него должны быть
+только настройки подключения — без блока `models`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "LocalAI": {
+      "name": "Local Host",
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:9932/v1",
+        "apiKey": "..."
+      }
+    }
+  }
+}
+```
+
+> Указывай `127.0.0.1`, а не `0.0.0.0`. `0.0.0.0` — адрес прослушивания
+> (bind), по нему нельзя ходить как клиенту.
+
+### ⚠️ Главное правило
+
+Если у модели в `opencode.json` **явно прописан `limit.context`**, он
+**перебивает** плагин. Поскольку плагин публикует модели сам, блок `models` у
+провайдера `LocalAI` стоит удалить целиком.
+
+### Параметры плагина (`ctx.options`)
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "./plugin",
+      "options": {
+        "provider": "LocalAI",
+        "tools": false,
+        "refreshMs": 30000,
+        "baseURL": "http://127.0.0.1:9932/v1"
+      }
+    }
+  ]
+}
+```
+
+| Опция | По умолчанию | Описание |
+|---|---|---|
+| `provider` | `LocalAI` | ID провайдера, чей список моделей ведётся. |
+| `tools` | `false` | Включать ли tool calling для обнаруженных моделей. Локальные chat-template редко его поддерживают. |
+| `refreshMs` | `30000` | Период перечитывания `/v1/models`, мс. |
+| `baseURL` | из настроек провайдера, иначе `http://127.0.0.1:9932` | Адрес сервера, если он не задан в конфиге. |
 
 ### Переменные окружения
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
-| `LOCALAI_CONTEXT_DEBUG` | — | Путь к файлу, куда пишется отладочный лог. Если не задана — лог идёт только в stdout. |
-
-### Константы в `plugin/index.js`
-
-| Константа | По умолчанию | Описание |
-|---|---|---|
-| `PROVIDER_ID` | `LocalAI` | ID провайдера в `opencode.json`. |
-| `FALLBACK_BASE_URL` | `http://192.168.0.124:8080` | Используется, если baseURL не удалось прочитать из конфига провайдера. |
-| `REFRESH_MS` | `30000` | Период перепроверки контекста, мс. |
+| `LOCALAI_DEBUG` | — | Путь к файлу отладочного лога. Если не задана — лог идёт только в stdout. |
 
 ## Проверка
 
-Запусти OpenCode с включённым отладочным логом:
+```powershell
+# Windows (PowerShell)
+$env:LOCALAI_DEBUG="$PWD\localai-debug.log"; opencode run "reply with OK"
+```
 
 ```bash
-# Windows (PowerShell)
-$env:LOCALAI_CONTEXT_DEBUG="$PWD\context-debug.log"; opencode run --agent build "reply with OK"
-
 # Linux / macOS
-LOCALAI_CONTEXT_DEBUG="$PWD/context-debug.log" opencode run --agent build "reply with OK"
+LOCALAI_DEBUG="$PWD/localai-debug.log" opencode run "reply with OK"
 ```
 
-В логе должны появиться строки:
+В логе должна появиться строка:
 
 ```
-[dynamic-context] detected Qwen3-Coder=163840
-[dynamic-context] applied limit.context=163840 to LocalAI/Qwen3-Coder
+[localai-discovery] discovered 10 model(s) from http://127.0.0.1:9932/v1/models:
+  gemma4-26a4b-styletune-rp (ctx=65536), ... (ctx=51200)
 ```
 
-Если строк нет, по порядку проверь:
+После этого модели появляются в `/models` под провайдером `LocalAI`.
 
-1. `limit.context` у модели не задан (см. «Главное правило»).
-2. `PROVIDER_ID` в `plugin/index.js` совпадает с ID провайдера в конфиге.
-3. Сервер отвечает на `GET {baseURL}/v1/models` и в ответе есть контекст
-   (`meta.n_ctx`, `context_length`, `max_model_len` и т.п.).
-4. Плагин действительно загружен: при старте в логе OpenCode есть запись
-   `[dynamic-context] ...`.
+Если моделей нет, проверь по порядку:
+
+1. Сервер отвечает: `curl http://127.0.0.1:9932/v1/models`.
+2. `baseURL` в конфиге совпадает с адресом сервера.
+3. Плагин загружен: при старте в логе OpenCode есть строка `[localai-discovery]`.
+4. В `opencode.json` у `LocalAI` не задано `limit.context` (см. «Главное правило»).
 
 ## Тестирование
 
-Отдельного набора автотестов пока нет: плагин не содержит публичного API, а его
-работа целиком зависит от внешнего локального сервера. Проверка выполняется
-вручную по разделу «Проверка» — это интеграционная проверка «плагин ↔ сервер ↔
-OpenCode».
-
-Временные отладочные скрипты, если понадобятся, складывай в `tmp/` в корне
-проекта (каталог не коммитится).
-
-## Обновление
-
-```bash
-opencode plugin update            # обновить все плагины
-opencode plugin update opencode-localai-dynamic-context
-```
-
-Для ручной установки (варианты 3–4) просто замени `index.js` на новую версию и
-перезапусти сервис: `opencode service restart`.
+Отдельного набора автотестов в репозитории нет. Локальная проверка разбора
+метаданных выполняется скриптом в `tmp/` (каталог не коммитится) на живых
+данных `/v1/models`.
 
 ## Удаление
 
 1. Убери запись плагина из `opencode.json` (при установке через CLI —
    `opencode plugin remove ...`).
-2. Удали каталог `<config>/plugins/localai-context/` (или
-   `<project>/.opencode/plugins/localai-context/`).
-3. Перезапусти сервис: `opencode service restart`.
-
-## ВАЖНО
-
-Временное решение. Когда в OpenCode вльют PR #27554 (local LAN provider
-discovery + автоопределение контекста), плагин можно удалить.
+2. Удали каталог `<config>/plugins/localai-discovery/`.
+3. Верни в конфиг блок `models` у провайдера `LocalAI`.
+4. Перезапусти сервис: `opencode service restart`.
 
 ## Ссылки
 

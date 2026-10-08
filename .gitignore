@@ -1,5 +1,7 @@
 # Временные отладочные скрипты, тесты и данные.
 tmp/
 
-# Отладочный лог плагина (путь задаётся через LOCALAI_CONTEXT_DEBUG).
+# Отладочные логи плагина (путь задаётся через LOCALAI_DEBUG).
+*.log
+localai-debug.log
 context-debug.log

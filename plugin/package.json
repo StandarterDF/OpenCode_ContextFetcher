@@ -1,6 +1,6 @@
 {
-  "name": "opencode-localai-dynamic-context",
-  "version": "0.1.0",
+  "name": "opencode-localai-discovery",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "index.js"
