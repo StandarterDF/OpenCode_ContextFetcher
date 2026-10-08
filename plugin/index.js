@@ -21,6 +21,8 @@ import { join } from "node:path"
 const PROVIDER_ID = "localai"
 const PROVIDER_NAME = "Local Host"
 const PROVIDER_PACKAGE = "@opencode/ai/providers/openai-compatible"
+// Built-in integration that owns the credential for the local provider.
+const PROVIDER_INTEGRATION = "localai"
 const FALLBACK_BASE_URL = "http://127.0.0.1:9932"
 const REFRESH_MS = 30_000
 
@@ -32,6 +34,7 @@ const FALLBACK_OUTPUT = 8_192
 // discovered models start with tools off. Set `tools: true` in plugin options
 // if your template does support it.
 const TOOLS = false
+const DEFAULT_API_KEY = "local"
 
 // Log file: LOCALAI_DEBUG overrides the path, pass logFile: false to disable.
 const DEFAULT_LOG_FILE = join(homedir(), ".config", "opencode", "localai-discovery.log")
@@ -176,10 +179,17 @@ export default {
       typeof options.provider === "string" && options.provider ? options.provider : PROVIDER_ID
     const providerName =
       typeof options.name === "string" && options.name ? options.name : PROVIDER_NAME
+    const integrationID =
+      typeof options.integration === "string" && options.integration
+        ? options.integration
+        : PROVIDER_INTEGRATION
     const tools = options.tools === true
     const refreshMs =
       Number.isFinite(options.refreshMs) && options.refreshMs > 0 ? Number(options.refreshMs) : REFRESH_MS
-    const apiKey = typeof options.apiKey === "string" && options.apiKey ? options.apiKey : undefined
+    // llama.cpp normally ignores Authorization, but the runtime treats a provider
+// without any credential as unavailable, so a placeholder is sent by default.
+const apiKey =
+  typeof options.apiKey === "string" && options.apiKey ? options.apiKey : DEFAULT_API_KEY
 
     let baseURL = typeof options.baseURL === "string" && options.baseURL ? options.baseURL : FALLBACK_BASE_URL
 
@@ -203,15 +213,25 @@ export default {
       name: providerName,
       activation: "enabled",
       package: PROVIDER_PACKAGE,
-      settings: apiKey ? { baseURL: endpointUrl(baseURL), apiKey } : { baseURL: endpointUrl(baseURL) },
+      // Links the provider to the built-in `localai` integration, so a
+      // credential connected via /connect (or /api/integration/<id>/connect/key)
+      // applies to it. Without this the provider stays unavailable.
+      integrationID: integrationID,
+      settings: { baseURL: endpointUrl(baseURL), apiKey },
     }
 
     await ctx.provider.transform((editor) => {
       if (!inventory) return
       const known = editor.list().some((record) => (record?.provider?.id ?? record?.id) === providerID)
-      if (known) editor.models.set(providerID, inventory)
-      else editor.add({ info: providerInfo, models: inventory })
-      published = true
+      log(`transform replay: provider "${providerID}" known=${known}, models=${inventory.length}`)
+      try {
+        if (known) editor.models.set(providerID, inventory)
+        else editor.add({ info: providerInfo, models: inventory })
+        published = true
+        log(`transform: applied (${known ? "models.set" : "editor.add"})`)
+      } catch (error) {
+        log(`transform: failed: ${error}`)
+      }
     })
 
     const refresh = async () => {
