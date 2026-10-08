@@ -1,33 +1,26 @@
 // LocalAI discovery for OpenCode V2.
 //
-// Custom OpenAI-compatible providers (llama.cpp, llama-swap, LM Studio, vLLM)
-// are not auto-discovered by OpenCode: built-in discovery only covers Ollama,
-// LM Studio and vLLM runtimes, and every other "Compatible" provider must list
-// its models in opencode.json by hand.
+// A local llama.cpp / llama-swap server behind an OpenAI-compatible endpoint is
+// NOT created by OpenCode from opencode.json, and it is not part of the
+// models.dev catalog either — so it never appears in /api/provider or /models,
+// no matter how it is declared.
 //
-// This plugin removes that manual step: it reads `<baseURL>/v1/models` and
-// publishes the returned inventory through the model transform, so OpenCode
-// shows whatever the local server currently serves. Model metadata that
-// llama-swap exposes in `status.args` / `status.preset` is used for
-// `limit.context`.
+// This plugin registers that provider itself: it reads `<baseURL>/v1/models`
+// and publishes both the provider and its models through
+// `ctx.provider.transform` -> `editor.add({ info, models })`. It then re-reads
+// the inventory on a timer and calls `ctx.provider.reload()` when it changes,
+// so switching models in llama-swap needs no restart of OpenCode.
 //
-// IMPORTANT 1: the provider ID in opencode.json must match the provider's
-// catalog/integration ID. The built-in local provider is `localai`
-// (lowercase). A custom ID such as `LocalAI` never registers.
-//
-// IMPORTANT 2: a custom provider needs at least one model entry in opencode.json
-// to register at all, so keep a single bootstrap model there. The plugin
-// replaces the rest of the inventory.
-//
-// The transform is re-run through ctx.model.reload() whenever the inventory
-// changes, so switching models in llama-swap needs no restart.
+// Metadata that llama-swap exposes in `status.args` / `status.preset` is used
+// for `limit.context`.
 
 import { appendFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
-// Built-in local provider ID (matches the `localai` integration).
 const PROVIDER_ID = "localai"
+const PROVIDER_NAME = "Local Host"
+const PROVIDER_PACKAGE = "@opencode/ai/providers/openai-compatible"
 const FALLBACK_BASE_URL = "http://127.0.0.1:9932"
 const REFRESH_MS = 30_000
 
@@ -64,9 +57,14 @@ function log(message) {
   }
 }
 
-function modelsUrl(baseURL) {
+// The OpenAI-compatible runtime expects the endpoint to include /v1.
+function endpointUrl(baseURL) {
   const base = String(baseURL).replace(/\/+$/, "")
-  return base.endsWith("/v1") ? `${base}/models` : `${base}/v1/models`
+  return base.endsWith("/v1") ? base : `${base}/v1`
+}
+
+function modelsUrl(baseURL) {
+  return `${endpointUrl(baseURL)}/models`
 }
 
 async function fetchEntries(baseURL) {
@@ -145,16 +143,25 @@ function readModalities(entry) {
   }
 }
 
-function toModel(entry, tools) {
+// Model.Info per the OpenCode V2 API schema. The schema forbids extra
+// properties, so the object is built complete rather than partially.
+function toModelInfo(entry, providerID, tools) {
   const id = String(entry.id ?? entry.model ?? entry.name)
+  const created = Number(entry.created)
   const capabilities = readModalities(entry)
+
   return {
     id,
+    modelID: id,
+    providerID,
     name: id,
-    tools,
-    input: capabilities.input,
-    output: capabilities.output,
-    context: readContext(entry),
+    capabilities: { tools, input: capabilities.input, output: capabilities.output },
+    variants: [],
+    time: { released: Number.isFinite(created) && created > 0 ? Math.floor(created * 1000) : 0 },
+    cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+    status: "active",
+    enabled: true,
+    limit: { context: readContext(entry), output: FALLBACK_OUTPUT },
   }
 }
 
@@ -167,21 +174,23 @@ export default {
 
     const providerID =
       typeof options.provider === "string" && options.provider ? options.provider : PROVIDER_ID
+    const providerName =
+      typeof options.name === "string" && options.name ? options.name : PROVIDER_NAME
     const tools = options.tools === true
     const refreshMs =
       Number.isFinite(options.refreshMs) && options.refreshMs > 0 ? Number(options.refreshMs) : REFRESH_MS
+    const apiKey = typeof options.apiKey === "string" && options.apiKey ? options.apiKey : undefined
 
     let baseURL = typeof options.baseURL === "string" && options.baseURL ? options.baseURL : FALLBACK_BASE_URL
+
+    // If the provider is already registered (previous run), prefer the endpoint
+    // from its settings so config and plugin cannot drift apart.
     try {
       const provider = await ctx.provider.get({ providerID })
       const configured = provider?.settings?.baseURL ?? provider?.provider?.settings?.baseURL
       if (typeof configured === "string" && configured) baseURL = configured
-      else log(`provider "${providerID}" found but settings.baseURL is empty; using ${baseURL}`)
     } catch {
-      log(
-        `provider "${providerID}" is not registered (check that opencode.json declares ` +
-          `"providers": { "${providerID}": ... } with a model entry); using ${baseURL}`,
-      )
+      // Not registered yet — the plugin registers it below.
     }
 
     // Captured by the transform; refreshed by the poll loop.
@@ -189,59 +198,41 @@ export default {
     let signature = ""
     let published = false
 
-    await ctx.model.transform((editor) => {
+    const providerInfo = {
+      id: providerID,
+      name: providerName,
+      activation: "enabled",
+      package: PROVIDER_PACKAGE,
+      settings: apiKey ? { baseURL: endpointUrl(baseURL), apiKey } : { baseURL: endpointUrl(baseURL) },
+    }
+
+    await ctx.provider.transform((editor) => {
       if (!inventory) return
-
-      const existing = editor.list(providerID)
-      if (existing.length === 0) {
-        log(`provider "${providerID}" has no models available yet; inventory not published`)
-        return
-      }
-
-      for (const model of inventory) {
-        editor.update(providerID, model.id, (draft) => {
-          draft.name = model.name
-          // `update` may create the model, and the draft is not guaranteed to
-          // carry every nested object, so build them defensively.
-          if (!draft.capabilities || typeof draft.capabilities !== "object") {
-            draft.capabilities = { tools: model.tools, input: [], output: [] }
-          }
-          if (!draft.limit || typeof draft.limit !== "object") {
-            draft.limit = { context: model.context, output: FALLBACK_OUTPUT }
-          }
-          draft.capabilities.tools = model.tools
-          draft.capabilities.input = model.input
-          draft.capabilities.output = model.output
-          draft.limit.context = model.context
-          draft.limit.output = FALLBACK_OUTPUT
-        })
-      }
-
-      // Drop models the server no longer serves (including the bootstrap entry).
-      const wanted = new Set(inventory.map((model) => model.id))
-      for (const model of existing) {
-        if (!wanted.has(model.id)) editor.remove(providerID, model.id)
-      }
-
+      const known = editor.list().some((record) => (record?.provider?.id ?? record?.id) === providerID)
+      if (known) editor.models.set(providerID, inventory)
+      else editor.add({ info: providerInfo, models: inventory })
       published = true
     })
 
     const refresh = async () => {
       const entries = await fetchEntries(baseURL)
-      const next = entries.map((entry) => toModel(entry, tools)).sort((a, b) => a.id.localeCompare(b.id))
+      const next = entries
+        .map((entry) => toModelInfo(entry, providerID, tools))
+        .sort((a, b) => a.id.localeCompare(b.id))
 
-      const nextSignature = next.map((model) => `${model.id}:${model.context}:${model.tools}`).join("|")
+      const nextSignature = next.map((model) => `${model.id}:${model.limit.context}`).join("|")
       if (nextSignature === signature) return
 
       signature = nextSignature
       inventory = next
       log(
         `discovered ${next.length} model(s) from ${modelsUrl(baseURL)}: ` +
-          next.map((model) => `${model.id} (ctx=${model.context})`).join(", "),
+          next.map((model) => `${model.id} (ctx=${model.limit.context})`).join(", "),
       )
+
       published = false
-      await ctx.model.reload()
-      log(published ? "inventory published" : "inventory NOT published (provider unavailable)")
+      await ctx.provider.reload()
+      log(published ? "provider published" : "provider NOT published")
     }
 
     try {
@@ -254,6 +245,8 @@ export default {
       () => void refresh().catch((error) => log(`discovery failed: ${error}`)),
       refreshMs,
     )
+
+    log(`watching ${baseURL} every ${refreshMs} ms (provider "${providerID}")`)
 
     return () => clearInterval(timer)
   },
