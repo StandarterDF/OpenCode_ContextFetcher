@@ -5,22 +5,29 @@
 // LM Studio and vLLM runtimes, and every other "Compatible" provider must list
 // its models in opencode.json by hand.
 //
-// This plugin removes that manual step for the configured provider: it reads
-// `<baseURL>/v1/models` and publishes the returned inventory through the
-// provider registry, so OpenCode shows whatever the local server currently
-// serves. Model metadata that llama-swap exposes in `status.args` /
-// `status.preset` is used for `limit.context`.
+// This plugin removes that manual step: it reads `<baseURL>/v1/models` and
+// publishes the returned inventory through the model transform, so OpenCode
+// shows whatever the local server currently serves. Model metadata that
+// llama-swap exposes in `status.args` / `status.preset` is used for
+// `limit.context`.
 //
-// IMPORTANT: an explicit `limit.context` in opencode.json wins over the
-// inventory published here. Remove such overrides so the plugin can control
-// the limit.
+// IMPORTANT 1: the provider ID in opencode.json must match the provider's
+// catalog/integration ID. The built-in local provider is `localai`
+// (lowercase). A custom ID such as `LocalAI` never registers.
 //
-// The transform is re-run through ctx.provider.reload() whenever the inventory
+// IMPORTANT 2: a custom provider needs at least one model entry in opencode.json
+// to register at all, so keep a single bootstrap model there. The plugin
+// replaces the rest of the inventory.
+//
+// The transform is re-run through ctx.model.reload() whenever the inventory
 // changes, so switching models in llama-swap needs no restart.
 
 import { appendFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 
-const PROVIDER_ID = "LocalAI"
+// Built-in local provider ID (matches the `localai` integration).
+const PROVIDER_ID = "localai"
 const FALLBACK_BASE_URL = "http://127.0.0.1:9932"
 const REFRESH_MS = 30_000
 
@@ -33,16 +40,27 @@ const FALLBACK_OUTPUT = 8_192
 // if your template does support it.
 const TOOLS = false
 
-// Optional debug log file. Set LOCALAI_DEBUG to a path to enable.
-const DEBUG_LOG = process.env.LOCALAI_DEBUG
+// Log file: LOCALAI_DEBUG overrides the path, pass logFile: false to disable.
+const DEFAULT_LOG_FILE = join(homedir(), ".config", "opencode", "localai-discovery.log")
+
+function resolveLogFile(options) {
+  if (options?.logFile === false) return undefined
+  if (typeof process.env.LOCALAI_DEBUG === "string" && process.env.LOCALAI_DEBUG) {
+    return process.env.LOCALAI_DEBUG
+  }
+  return DEFAULT_LOG_FILE
+}
+
+let logFile
 
 function log(message) {
-  console.log(`[localai-discovery] ${message}`)
-  if (!DEBUG_LOG) return
+  const line = `[localai-discovery] ${message}`
+  console.log(line)
+  if (!logFile) return
   try {
-    appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${message}\n`)
+    appendFileSync(logFile, `${new Date().toISOString()} ${line}\n`)
   } catch {
-    // Ignore debug write failures.
+    // Ignore log write failures.
   }
 }
 
@@ -127,25 +145,16 @@ function readModalities(entry) {
   }
 }
 
-// Model.Info (see OpenCode V2 API schema). Fields are kept complete and exact:
-// Model.Info forbids extra properties.
-function toModelInfo(entry, providerID, tools) {
+function toModel(entry, tools) {
   const id = String(entry.id ?? entry.model ?? entry.name)
-  const created = Number(entry.created)
   const capabilities = readModalities(entry)
-
   return {
     id,
-    modelID: id,
-    providerID,
     name: id,
-    capabilities: { tools, input: capabilities.input, output: capabilities.output },
-    variants: [],
-    time: { released: Number.isFinite(created) && created > 0 ? Math.floor(created * 1000) : 0 },
-    cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
-    status: "active",
-    enabled: true,
-    limit: { context: readContext(entry), output: FALLBACK_OUTPUT },
+    tools,
+    input: capabilities.input,
+    output: capabilities.output,
+    context: readContext(entry),
   }
 }
 
@@ -154,6 +163,7 @@ export default {
 
   async setup(ctx) {
     const options = ctx.options ?? {}
+    logFile = resolveLogFile(options)
 
     const providerID =
       typeof options.provider === "string" && options.provider ? options.provider : PROVIDER_ID
@@ -166,38 +176,72 @@ export default {
       const provider = await ctx.provider.get({ providerID })
       const configured = provider?.settings?.baseURL ?? provider?.provider?.settings?.baseURL
       if (typeof configured === "string" && configured) baseURL = configured
+      else log(`provider "${providerID}" found but settings.baseURL is empty; using ${baseURL}`)
     } catch {
-      // Provider is not registered yet; keep the configured fallback.
+      log(
+        `provider "${providerID}" is not registered (check that opencode.json declares ` +
+          `"providers": { "${providerID}": ... } with a model entry); using ${baseURL}`,
+      )
     }
 
-    // Captured by the transform below; refreshed by the poll loop.
+    // Captured by the transform; refreshed by the poll loop.
     let inventory = null
     let signature = ""
+    let published = false
 
-    await ctx.provider.transform((editor) => {
+    await ctx.model.transform((editor) => {
       if (!inventory) return
-      const known = editor.list().some((record) => record.provider.id === providerID)
-      if (!known) return
-      editor.models.set(providerID, inventory)
+
+      const existing = editor.list(providerID)
+      if (existing.length === 0) {
+        log(`provider "${providerID}" has no models available yet; inventory not published`)
+        return
+      }
+
+      for (const model of inventory) {
+        editor.update(providerID, model.id, (draft) => {
+          draft.name = model.name
+          // `update` may create the model, and the draft is not guaranteed to
+          // carry every nested object, so build them defensively.
+          if (!draft.capabilities || typeof draft.capabilities !== "object") {
+            draft.capabilities = { tools: model.tools, input: [], output: [] }
+          }
+          if (!draft.limit || typeof draft.limit !== "object") {
+            draft.limit = { context: model.context, output: FALLBACK_OUTPUT }
+          }
+          draft.capabilities.tools = model.tools
+          draft.capabilities.input = model.input
+          draft.capabilities.output = model.output
+          draft.limit.context = model.context
+          draft.limit.output = FALLBACK_OUTPUT
+        })
+      }
+
+      // Drop models the server no longer serves (including the bootstrap entry).
+      const wanted = new Set(inventory.map((model) => model.id))
+      for (const model of existing) {
+        if (!wanted.has(model.id)) editor.remove(providerID, model.id)
+      }
+
+      published = true
     })
 
     const refresh = async () => {
       const entries = await fetchEntries(baseURL)
-      const next = entries.map((entry) => toModelInfo(entry, providerID, tools))
-      next.sort((a, b) => a.id.localeCompare(b.id))
+      const next = entries.map((entry) => toModel(entry, tools)).sort((a, b) => a.id.localeCompare(b.id))
 
-      const nextSignature = next
-        .map((model) => `${model.id}:${model.limit.context}:${model.capabilities.tools}`)
-        .join("|")
+      const nextSignature = next.map((model) => `${model.id}:${model.context}:${model.tools}`).join("|")
       if (nextSignature === signature) return
 
       signature = nextSignature
       inventory = next
       log(
         `discovered ${next.length} model(s) from ${modelsUrl(baseURL)}: ` +
-          next.map((model) => `${model.id} (ctx=${model.limit.context})`).join(", "),
+          next.map((model) => `${model.id} (ctx=${model.context})`).join(", "),
       )
-      await ctx.provider.reload()
+      published = false
+      await ctx.model.reload()
+      log(published ? "inventory published" : "inventory NOT published (provider unavailable)")
     }
 
     try {

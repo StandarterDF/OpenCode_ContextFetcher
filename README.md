@@ -12,8 +12,9 @@ llama-swap на llama.cpp) модели нужно перечислять в `op
 
 Плагин снимает эту ручную работу:
 
-- опрашивает `<baseURL>/v1/models` и публикует ответ в реестр провайдера через
-  `ctx.provider.transform` → `editor.models.set(...)`;
+- опрашивает `<baseURL>/v1/models` и публикует ответ через
+  `ctx.model.transform`: добавляет и обновляет модели провайдера, убирает те,
+  которых на сервере больше нет;
 - берёт `limit.context` из того, что отдаёт сервер: явные поля
   (`context_length`, `max_model_len`, `meta.n_ctx`, …), затем флаги запуска
   llama-swap (`status.args` → `--ctx-size`) и его preset-файл
@@ -130,11 +131,17 @@ opencode service restart
 > Указывай `127.0.0.1`, а не `0.0.0.0`. `0.0.0.0` — адрес прослушивания
 > (bind), по нему нельзя ходить как клиенту.
 
-### ⚠️ Главное правило
+### ⚠️ Главные правила
 
-Если у модели в `opencode.json` **явно прописан `limit.context`**, он
-**перебивает** плагин. Поскольку плагин публикует модели сам, блок `models` у
-провайдера `LocalAI` стоит удалить целиком.
+1. **ID провайдера — `localai`**, строчными буквами. Это ID встроенной
+   интеграции OpenCode. С большой буквы (`LocalAI`) провайдер не
+   регистрируется вообще: `/api/provider` отвечает `ProviderNotFoundError`,
+   модели не появляются, и плагину нечего обновлять.
+2. **Нужна одна bootstrap-модель** в `opencode.json` — кастомный провайдер без
+   единой модели не материализуется. Плагин подхватит остальные модели и
+   удалит bootstrap-модель сам.
+3. **Не задавай `limit.context` явно** — такое значение перебьёт то, что
+   плагин взял из `/v1/models`.
 
 ### Параметры плагина (`ctx.options`)
 
@@ -157,16 +164,17 @@ opencode service restart
 
 | Опция | По умолчанию | Описание |
 |---|---|---|
-| `provider` | `LocalAI` | ID провайдера, чей список моделей ведётся. |
+| `provider` | `localai` | ID провайдера, чей список моделей ведётся. |
 | `tools` | `false` | Включать ли tool calling для обнаруженных моделей. Локальные chat-template редко его поддерживают. |
 | `refreshMs` | `30000` | Период перечитывания `/v1/models`, мс. |
 | `baseURL` | из настроек провайдера, иначе `http://127.0.0.1:9932` | Адрес сервера, если он не задан в конфиге. |
+| `logFile` | `~/.config/opencode/localai-discovery.log` | Путь к лог-файлу. `false` — писать только в stdout. |
 
 ### Переменные окружения
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
-| `LOCALAI_DEBUG` | — | Путь к файлу отладочного лога. Если не задана — лог идёт только в stdout. |
+| `LOCALAI_DEBUG` | — | Переопределяет путь к лог-файлу. |
 
 ## Проверка
 
@@ -185,16 +193,22 @@ LOCALAI_DEBUG="$PWD/localai-debug.log" opencode run "reply with OK"
 ```
 [localai-discovery] discovered 10 model(s) from http://127.0.0.1:9932/v1/models:
   gemma4-26a4b-styletune-rp (ctx=65536), ... (ctx=51200)
+[localai-discovery] inventory published
 ```
 
-После этого модели появляются в `/models` под провайдером `LocalAI`.
+По умолчанию лог пишется в `~/.config/opencode/localai-discovery.log` —
+это самый быстрый способ проверки, потому что `console.log` плагинов не
+попадает в `opencode.log`.
 
 Если моделей нет, проверь по порядку:
 
-1. Сервер отвечает: `curl http://127.0.0.1:9932/v1/models`.
-2. `baseURL` в конфиге совпадает с адресом сервера.
-3. Плагин загружен: при старте в логе OpenCode есть строка `[localai-discovery]`.
-4. В `opencode.json` у `LocalAI` не задано `limit.context` (см. «Главное правило»).
+1. Лог: ищи `inventory NOT published` или `provider "localai" is not registered`.
+2. Сервер отвечает: `curl http://127.0.0.1:9932/v1/models`.
+3. В `opencode.json` ключ провайдера — именно `localai`, и в нём есть хотя бы
+   одна модель (см. «Главные правила»).
+4. Провайдер подключён: `opencode api get /api/provider` содержит `localai`.
+   Если нет — выполни `/connect` в TUI и выбери **Local Host**.
+5. Сервис перезапущен после правки конфига: `opencode service restart`.
 
 ## Тестирование
 
