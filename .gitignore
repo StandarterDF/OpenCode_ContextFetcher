@@ -5,3 +5,6 @@ tmp/
 *.log
 localai-debug.log
 context-debug.log
+
+# Трассировка шима из evidence/.
+shim-trace.log
