@@ -30,11 +30,11 @@ if exist "%LEGACY%" (
 
 echo [OK] Плагин установлен в: %DST%
 echo.
-echo Плагин сам подтягивает список моделей с /v1/models, поэтому в
-echo "%CONFIG_DIR%\opencode.json" у провайдера LocalAI блок "models"
-echo больше не нужен - его можно удалить.
+echo Плагин делает локальные модели доступными как aliases на активном
+echo провайдере (по умолчанию "opencode"), напр. opencode/local-<model>.
+echo Дополнительная настройка в opencode.json не нужна.
 echo.
-echo После правки конфига перезапусти сервис: opencode service restart
+echo Если сервис не подхватил плагин сам - перезапусти его: opencode service restart
 echo.
 
 pause

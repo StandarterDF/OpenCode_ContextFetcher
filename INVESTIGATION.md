@@ -261,3 +261,93 @@ A second reproduction without any config, via a plugin:
 1. Plugin calls `ctx.provider.transform(editor => editor.add({ info, models }))`.
 2. The callback runs without error (logged from inside it).
 3. `opencode api get /api/provider` — provider still absent.
+
+---
+
+## 8. Addendum (2026-10-08) — уточнения и найденный обход
+
+Вердикт раздела 1 в целом верен: на 2.0.24 новый провайдер не активируется.
+Ниже — что уточнено повторными проверками и какой путь работает.
+
+### 8.1 Что уточнено
+
+- **Провайдер всё-таки попадает в реестр.** `ctx.provider.list()` из плагина
+  видит добавленный `localai` (`activation: "enabled"`) и его модели
+  (`ctx.model.list()` — 25–37 моделей). Но `GET /api/provider` и `/api/model`
+  (активные/доступные) их не показывают: активны только `opencode` и
+  `opencode-go` — провайдеры с рабочим подключением. То есть проблема не в
+  `editor.add`, а в том, что динамический провайдер не становится активным.
+- **`integrationID: "localai"` неверен.** Интеграции `localai` не существует
+  (`GET /api/integration/localai` → 404). Реально есть `llama`, `lmstudio`,
+  `ollama-cloud`. Но и с `integrationID: "llama"` + активным credential, и с
+  `sourceConnection`, и с `canonical` провайдер не активируется.
+- **Конфиг `providers` не создаёт новых провайдеров.** `providers.acme` /
+  `providers.localsrv` не попадают даже в реестр. Но добавление/переопределение
+  модели у **каталожного** провайдера через `providers` работает (проверено:
+  `providers.opencode.models.config-test-model` → `opencode/config-test-model`
+  отработала).
+- **Встроенный discovery опрашивает.** LM Studio (`/api/v1/models` на
+  `127.0.0.1:1234`) и vLLM (`/health` + `/v1/models` на `127.0.0.1:8000`)
+  реально получают запросы. «Ноль запросов» в attempt #12 — следствие того, что
+  шим стоял на `9933` и подключался через `providers.lmstudio.settings.baseURL`,
+  а такой override для не активированного провайдера не применяется. Но и при
+  корректном ответе на дефолтном порту модели не активировались.
+
+### 8.2 Что работает
+
+Модели можно добавить к **активному** каталожному провайдеру. Проверено двумя
+способами (оба дают работающий вызов локальной модели):
+
+1. Конфиг: `providers.opencode.models.<alias>` с каталожным `modelID`,
+   model-level `settings.baseURL` и `body.model`.
+2. Плагин: `ctx.model.transform` → `editor.update("opencode", alias, draft => …)`
+   (в доке `update` «can add a model only under an available provider»).
+
+На этом построена версия плагина 0.4.0: алиасы на `opencode` с `baseURL` на
+локальный сервер и подменой `body.model`.
+
+### 8.3 Быстрый обход без плагина
+
+```jsonc
+{
+  "providers": {
+    "opencode": {
+      "models": {
+        "local-gemma": {
+          "modelID": "big-pickle",
+          "settings": { "baseURL": "http://127.0.0.1:9932/v1" },
+          "body": { "model": "gemma4-26a4b-styletune-rp" },
+          "limit": { "context": 65536, "output": 8192 },
+          "capabilities": { "tools": true, "input": ["text"], "output": ["text"] }
+        }
+      }
+    }
+  }
+}
+```
+
+Использование: `opencode run --model opencode/local-gemma "…"`.
+
+### 8.4 Для issue
+
+Готовое воспроизведение бага (без плагинов и локального сервера достаточно
+проверить недоступность самого провайдера):
+
+```jsonc
+{
+  "providers": {
+    "acme": {
+      "name": "Acme",
+      "env": ["ACME_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "https://llm.acme.example/v1" },
+      "models": { "qwen3-coder": { "name": "Qwen 3 Coder" } }
+    }
+  }
+}
+```
+
+Ожидается (по документации V2 «Providers → Custom»), что `acme` доступен; на
+2.0.24 `GET /api/provider` его не содержит, а `opencode run --model
+acme/qwen3-coder` отвечает `Model unavailable`. Аналогично себя ведёт
+`ctx.provider.transform` → `editor.add`.

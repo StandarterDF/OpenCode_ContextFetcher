@@ -1,42 +1,50 @@
-// LocalAI discovery for OpenCode V2.
+// LocalAI discovery for OpenCode V2 (workaround build).
 //
-// A local llama.cpp / llama-swap server behind an OpenAI-compatible endpoint is
-// NOT created by OpenCode from opencode.json, and it is not part of the
-// models.dev catalog either — so it never appears in /api/provider or /models,
-// no matter how it is declared.
+// Background: on OpenCode 2.0.24 a *new* provider (whether declared in
+// `providers` in opencode.json or added from a plugin via
+// `ctx.provider.transform` -> `editor.add`) is registered but never becomes
+// "available", so its models are not selectable ("Model unavailable").
+// See INVESTIGATION.md for the full evidence.
 //
-// This plugin registers that provider itself: it reads `<baseURL>/v1/models`
-// and publishes both the provider and its models through
-// `ctx.provider.transform` -> `editor.add({ info, models })`. It then re-reads
-// the inventory on a timer and calls `ctx.provider.reload()` when it changes,
-// so switching models in llama-swap needs no restart of OpenCode.
+// Working scheme, verified on 2.0.24: attach the local models to an already
+// available catalog provider (default `opencode`). For each local model the
+// plugin creates an *alias* model on that provider with:
 //
-// Metadata that llama-swap exposes in `status.args` / `status.preset` is used
-// for `limit.context`.
+//   * `modelID` set to a real catalog model of the host provider, so OpenCode
+//     materialises the alias (a non-catalog modelID is dropped);
+//   * model-level `settings.baseURL` pointing at the local server;
+//   * `body.model` overriding the outgoing model name with the real local one;
+//   * explicit `limit` / `capabilities` / `cost` (otherwise they are inherited
+//     from the catalog base model and would be wrong).
+//
+// The alias is exposed as `<host>/<prefix><localModelID>` (e.g.
+// `opencode/local-gemma4-26a4b-styletune-rp`).
+//
+// The list is re-read every `refreshMs` and published with
+// `ctx.model.transform`, so switching models in llama-swap needs no OpenCode
+// restart. No external dependencies, no network except the local server.
 
 import { appendFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
-const PROVIDER_ID = "localai"
-const PROVIDER_NAME = "Local Host"
-const PROVIDER_PACKAGE = "@opencode/ai/providers/openai-compatible"
-// Built-in integration that owns the credential for the local provider.
-const PROVIDER_INTEGRATION = "localai"
-const FALLBACK_BASE_URL = "http://127.0.0.1:9932"
+// Available catalog provider the local models are attached to.
+const HOST_PROVIDER = "opencode"
+// Catalog modelID used to materialise aliases. Must be a real model of the host
+// provider; a free one keeps the alias enabled under opencode.models-disabler.
+const BASE_MODEL = "big-pickle"
+// Prefix that marks plugin-managed aliases on the host provider.
+const ALIAS_PREFIX = "local-"
+
+const FALLBACK_BASE_URL = "http://127.0.0.1:9931"
 const REFRESH_MS = 30_000
 
-// Used when the server does not report a context size.
 const FALLBACK_CONTEXT = 32_768
 const FALLBACK_OUTPUT = 8_192
 
-// Local llama.cpp chat templates rarely implement OpenAI tool calling, so
-// discovered models start with tools off. Set `tools: true` in plugin options
-// if your template does support it.
+// Local llama.cpp chat templates rarely implement OpenAI tool calling.
 const TOOLS = false
-const DEFAULT_API_KEY = "local"
 
-// Log file: LOCALAI_DEBUG overrides the path, pass logFile: false to disable.
 const DEFAULT_LOG_FILE = join(homedir(), ".config", "opencode", "localai-discovery.log")
 
 function resolveLogFile(options) {
@@ -60,7 +68,6 @@ function log(message) {
   }
 }
 
-// The OpenAI-compatible runtime expects the endpoint to include /v1.
 function endpointUrl(baseURL) {
   const base = String(baseURL).replace(/\/+$/, "")
   return base.endsWith("/v1") ? base : `${base}/v1`
@@ -80,7 +87,6 @@ async function fetchEntries(baseURL) {
   return entries.filter((entry) => typeof (entry?.id ?? entry?.model ?? entry?.name) === "string")
 }
 
-// llama-swap/llama.cpp report the context size only as a server flag.
 function argValue(args, names) {
   if (!Array.isArray(args)) return undefined
   for (let i = 0; i < args.length; i++) {
@@ -110,8 +116,6 @@ function presetValue(preset, keys) {
   return undefined
 }
 
-// Order: explicit API metadata, then llama-swap server args, then preset file,
-// then the fallback.
 function readContext(entry) {
   const candidates = [
     entry?.context_length,
@@ -146,25 +150,16 @@ function readModalities(entry) {
   }
 }
 
-// Model.Info per the OpenCode V2 API schema. The schema forbids extra
-// properties, so the object is built complete rather than partially.
-function toModelInfo(entry, providerID, tools) {
+// Turn one `/v1/models` entry into the descriptor captured by the transform.
+function toDescriptor(entry, tools) {
   const id = String(entry.id ?? entry.model ?? entry.name)
-  const created = Number(entry.created)
-  const capabilities = readModalities(entry)
-
+  const modalities = readModalities(entry)
   return {
     id,
     modelID: id,
-    providerID,
     name: id,
-    capabilities: { tools, input: capabilities.input, output: capabilities.output },
-    variants: [],
-    time: { released: Number.isFinite(created) && created > 0 ? Math.floor(created * 1000) : 0 },
-    cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
-    status: "active",
-    enabled: true,
     limit: { context: readContext(entry), output: FALLBACK_OUTPUT },
+    capabilities: { tools, input: modalities.input, output: modalities.output },
   }
 }
 
@@ -175,84 +170,87 @@ export default {
     const options = ctx.options ?? {}
     logFile = resolveLogFile(options)
 
-    const providerID =
-      typeof options.provider === "string" && options.provider ? options.provider : PROVIDER_ID
-    const providerName =
-      typeof options.name === "string" && options.name ? options.name : PROVIDER_NAME
-    const integrationID =
-      typeof options.integration === "string" && options.integration
-        ? options.integration
-        : PROVIDER_INTEGRATION
+    const host = typeof options.host === "string" && options.host ? options.host : HOST_PROVIDER
+    const baseModel =
+      typeof options.baseModel === "string" && options.baseModel ? options.baseModel : BASE_MODEL
+    const prefix = typeof options.prefix === "string" && options.prefix ? options.prefix : ALIAS_PREFIX
     const tools = options.tools === true
     const refreshMs =
       Number.isFinite(options.refreshMs) && options.refreshMs > 0 ? Number(options.refreshMs) : REFRESH_MS
-    // llama.cpp normally ignores Authorization, but the runtime treats a provider
-// without any credential as unavailable, so a placeholder is sent by default.
-const apiKey =
-  typeof options.apiKey === "string" && options.apiKey ? options.apiKey : DEFAULT_API_KEY
-
-    let baseURL = typeof options.baseURL === "string" && options.baseURL ? options.baseURL : FALLBACK_BASE_URL
-
-    // If the provider is already registered (previous run), prefer the endpoint
-    // from its settings so config and plugin cannot drift apart.
-    try {
-      const provider = await ctx.provider.get({ providerID })
-      const configured = provider?.settings?.baseURL ?? provider?.provider?.settings?.baseURL
-      if (typeof configured === "string" && configured) baseURL = configured
-    } catch {
-      // Not registered yet — the plugin registers it below.
-    }
+    const baseURL =
+      typeof options.baseURL === "string" && options.baseURL ? options.baseURL : FALLBACK_BASE_URL
 
     // Captured by the transform; refreshed by the poll loop.
     let inventory = null
+    let inventoryAliases = new Set()
     let signature = ""
-    let published = false
+    let published = 0
 
-    const providerInfo = {
-      id: providerID,
-      name: providerName,
-      activation: "enabled",
-      package: PROVIDER_PACKAGE,
-      // Links the provider to the built-in `localai` integration, so a
-      // credential connected via /connect (or /api/integration/<id>/connect/key)
-      // applies to it. Without this the provider stays unavailable.
-      integrationID: integrationID,
-      settings: { baseURL: endpointUrl(baseURL), apiKey },
+    let registration
+    try {
+      registration = await ctx.model.transform((editor) => {
+        // Keep the last known aliases while the server is unreachable.
+        if (!inventory) return
+
+        // Drop aliases whose model disappeared from the local server.
+        let existing = []
+        try {
+          existing = editor.list(host)
+        } catch {
+          // Host provider is not present in this location.
+        }
+        for (const model of existing) {
+          const id = String(model?.id ?? "")
+          if (id.startsWith(prefix) && !inventoryAliases.has(id)) {
+            editor.remove(host, id)
+            log(`removed stale alias ${host}/${id}`)
+          }
+        }
+
+        published = 0
+        for (const model of inventory) {
+          const alias = prefix + model.id
+          editor.update(host, alias, (draft) => {
+            draft.modelID = baseModel
+            draft.name = `Local: ${model.name}`
+            // Redirect this model's endpoint to the local server.
+            draft.settings = { ...(draft.settings ?? {}), baseURL: endpointUrl(baseURL) }
+            // Rewrite the outgoing model name to the real local one.
+            draft.body = { ...(draft.body ?? {}), model: model.modelID }
+            draft.limit = { context: model.limit.context, output: model.limit.output }
+            draft.capabilities = model.capabilities
+            draft.cost = [{ input: 0, output: 0, cache: { read: 0, write: 0 } }]
+            draft.variants = []
+            draft.time = { released: 0 }
+            draft.status = "active"
+            draft.enabled = true
+          })
+          published += 1
+        }
+        log(`transform replay: published ${published} alias(es) on ${host}`)
+      })
+    } catch (error) {
+      log(`could not register the model transform: ${error}`)
+      return
     }
-
-    await ctx.provider.transform((editor) => {
-      if (!inventory) return
-      const known = editor.list().some((record) => (record?.provider?.id ?? record?.id) === providerID)
-      log(`transform replay: provider "${providerID}" known=${known}, models=${inventory.length}`)
-      try {
-        if (known) editor.models.set(providerID, inventory)
-        else editor.add({ info: providerInfo, models: inventory })
-        published = true
-        log(`transform: applied (${known ? "models.set" : "editor.add"})`)
-      } catch (error) {
-        log(`transform: failed: ${error}`)
-      }
-    })
 
     const refresh = async () => {
       const entries = await fetchEntries(baseURL)
-      const next = entries
-        .map((entry) => toModelInfo(entry, providerID, tools))
-        .sort((a, b) => a.id.localeCompare(b.id))
+      const next = entries.map((entry) => toDescriptor(entry, tools)).sort((a, b) => a.id.localeCompare(b.id))
 
-      const nextSignature = next.map((model) => `${model.id}:${model.limit.context}`).join("|")
+      const nextSignature = next.map((m) => `${m.id}:${m.limit.context}:${m.capabilities.tools}`).join("|")
       if (nextSignature === signature) return
 
       signature = nextSignature
       inventory = next
+      inventoryAliases = new Set(next.map((m) => prefix + m.id))
       log(
         `discovered ${next.length} model(s) from ${modelsUrl(baseURL)}: ` +
-          next.map((model) => `${model.id} (ctx=${model.limit.context})`).join(", "),
+          next.map((m) => `${m.id} (ctx=${m.limit.context})`).join(", "),
       )
 
-      published = false
-      await ctx.provider.reload()
-      log(published ? "provider published" : "provider NOT published")
+      await ctx.model.reload()
+      log(`published ${published} alias(es) as ${host}/${prefix}<model>`)
     }
 
     try {
@@ -261,13 +259,23 @@ const apiKey =
       log(`initial discovery failed: ${error}`)
     }
 
+    // Force one registry read so the transform runs even when nothing changed.
+    try {
+      await ctx.model.list()
+    } catch (error) {
+      log(`could not read the model registry: ${error}`)
+    }
+
     const timer = setInterval(
       () => void refresh().catch((error) => log(`discovery failed: ${error}`)),
       refreshMs,
     )
 
-    log(`watching ${baseURL} every ${refreshMs} ms (provider "${providerID}")`)
+    log(`watching ${baseURL} every ${refreshMs} ms (aliases on "${host}")`)
 
-    return () => clearInterval(timer)
+    return () => {
+      clearInterval(timer)
+      void registration.dispose()
+    }
   },
 }
