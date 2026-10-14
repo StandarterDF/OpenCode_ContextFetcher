@@ -40,7 +40,6 @@ const FALLBACK_BASE_URL = "http://127.0.0.1:9931"
 const REFRESH_MS = 30_000
 
 const FALLBACK_CONTEXT = 32_768
-const FALLBACK_OUTPUT = 8_192
 
 // Local llama.cpp chat templates rarely implement OpenAI tool calling.
 const TOOLS = false
@@ -154,11 +153,14 @@ function readModalities(entry) {
 function toDescriptor(entry, tools) {
   const id = String(entry.id ?? entry.model ?? entry.name)
   const modalities = readModalities(entry)
+  const context = readContext(entry)
   return {
     id,
     modelID: id,
     name: id,
-    limit: { context: readContext(entry), output: FALLBACK_OUTPUT },
+    // Output limit mirrors the context window: local servers do not report a
+    // separate generation cap, and llama.cpp allows generating up to n_ctx.
+    limit: { context, output: context },
     capabilities: { tools, input: modalities.input, output: modalities.output },
   }
 }

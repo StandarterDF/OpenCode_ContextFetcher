@@ -25,6 +25,8 @@ llama.cpp) модели нужно перечислять вручную. Пла
   (`context_length`, `max_model_len`, `meta.n_ctx`, …), затем флаги запуска
   llama-swap (`status.args` → `--ctx-size`) и его preset-файл
   (`status.preset` → `ctx-size = …`);
+- задаёт `limit.output` равным контексту: локальные серверы не сообщают
+  отдельный лимит генерации, а llama.cpp позволяет генерировать до `n_ctx`;
 - перечитывает список и вызывает `ctx.model.reload()` при изменении —
   переключение моделей в роутере подхватывается без перезапуска OpenCode;
 - задаёт `capabilities.input/output` из `architecture.input_modalities`;

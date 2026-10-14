@@ -108,7 +108,6 @@ export default {
 | `FALLBACK_BASE_URL` | `http://127.0.0.1:9931` | Адрес сервера по умолчанию. |
 | `REFRESH_MS` | `30000` | Период опроса `/v1/models`. |
 | `FALLBACK_CONTEXT` | `32768` | Контекст, если сервер не сообщил размер. |
-| `FALLBACK_OUTPUT` | `8192` | Лимит ответа. |
 | `TOOLS` | `false` | Tool calling выключен по умолчанию. |
 
 ## Переменные окружения
