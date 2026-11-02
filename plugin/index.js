@@ -1,24 +1,20 @@
-// LocalAI discovery for OpenCode V2 (workaround build).
+// LocalAI discovery for OpenCode V2.
 //
-// Background: on OpenCode 2.0.24 a *new* provider (whether declared in
-// `providers` in opencode.json or added from a plugin via
-// `ctx.provider.transform` -> `editor.add`) is registered but never becomes
-// "available", so its models are not selectable ("Model unavailable").
-// See INVESTIGATION.md for the full evidence.
+// Publishes the models of a local OpenAI-compatible server (llama.cpp /
+// llama-swap) into the model registry and keeps them in sync.
 //
-// Working scheme, verified on 2.0.24: attach the local models to an already
-// available catalog provider (default `opencode`). For each local model the
-// plugin creates an *alias* model on that provider with:
+// Two modes:
 //
-//   * `modelID` set to a real catalog model of the host provider, so OpenCode
-//     materialises the alias (a non-catalog modelID is dropped);
-//   * model-level `settings.baseURL` pointing at the local server;
-//   * `body.model` overriding the outgoing model name with the real local one;
-//   * explicit `limit` / `capabilities` / `cost` (otherwise they are inherited
-//     from the catalog base model and would be wrong).
+//   * native (default): models are published under a real provider declared in
+//     `providers` (default `localai`). The provider must be allowed by any
+//     `provider.use` policy (see INVESTIGATION.md). Models are exposed as
+//     `<host>/<modelID>` and use the provider-level `settings.baseURL`.
 //
-// The alias is exposed as `<host>/<prefix><localModelID>` (e.g.
-// `opencode/local-gemma4-26a4b-styletune-rp`).
+//   * alias (legacy, set `baseModel`): models are attached to an already
+//     available catalog provider (default `opencode`) as aliases. Each alias
+//     gets a catalog `modelID`, a model-level `settings.baseURL` and `body.model`
+//     overriding the outgoing model name. Exposed as
+//     `<host>/<prefix><modelID>` (e.g. `opencode/local-gemma4-...`).
 //
 // The list is re-read every `refreshMs` and published with
 // `ctx.model.transform`, so switching models in llama-swap needs no OpenCode
@@ -28,12 +24,15 @@ import { appendFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
-// Available catalog provider the local models are attached to.
-const HOST_PROVIDER = "opencode"
-// Catalog modelID used to materialise aliases. Must be a real model of the host
-// provider; a free one keeps the alias enabled under opencode.models-disabler.
-const BASE_MODEL = "big-pickle"
-// Prefix that marks plugin-managed aliases on the host provider.
+// Provider that receives the local models.
+const HOST_PROVIDER = "localai"
+// Empty = native mode (models keep their real ids under `host`). A non-empty
+// catalog modelID switches to alias mode: models are attached to a catalog
+// provider as aliases of that base model.
+const BASE_MODEL = ""
+// Native mode exposes the real upstream ids (no prefix); alias mode adds a
+// prefix so stale plugin-managed aliases can be recognised and removed.
+const NATIVE_PREFIX = ""
 const ALIAS_PREFIX = "local-"
 
 const FALLBACK_BASE_URL = "http://127.0.0.1:9931"
@@ -173,9 +172,10 @@ export default {
     logFile = resolveLogFile(options)
 
     const host = typeof options.host === "string" && options.host ? options.host : HOST_PROVIDER
-    const baseModel =
-      typeof options.baseModel === "string" && options.baseModel ? options.baseModel : BASE_MODEL
-    const prefix = typeof options.prefix === "string" && options.prefix ? options.prefix : ALIAS_PREFIX
+    const baseModel = options.baseModel === undefined ? BASE_MODEL : String(options.baseModel)
+    const nativeMode = baseModel === ""
+    const prefix =
+      options.prefix === undefined ? (nativeMode ? NATIVE_PREFIX : ALIAS_PREFIX) : String(options.prefix)
     const tools = options.tools === true
     const refreshMs =
       Number.isFinite(options.refreshMs) && options.refreshMs > 0 ? Number(options.refreshMs) : REFRESH_MS
@@ -205,7 +205,7 @@ export default {
           const id = String(model?.id ?? "")
           if (id.startsWith(prefix) && !inventoryAliases.has(id)) {
             editor.remove(host, id)
-            log(`removed stale alias ${host}/${id}`)
+            log(`removed stale model ${host}/${id}`)
           }
         }
 
@@ -213,12 +213,18 @@ export default {
         for (const model of inventory) {
           const alias = prefix + model.id
           editor.update(host, alias, (draft) => {
-            draft.modelID = baseModel
-            draft.name = `Local: ${model.name}`
-            // Redirect this model's endpoint to the local server.
-            draft.settings = { ...(draft.settings ?? {}), baseURL: endpointUrl(baseURL) }
-            // Rewrite the outgoing model name to the real local one.
-            draft.body = { ...(draft.body ?? {}), model: model.modelID }
+            if (nativeMode) {
+              // Native provider: the model id is the upstream id, and the
+              // provider-level settings.baseURL already points at the server.
+              draft.modelID = model.modelID
+              draft.name = model.name
+            } else {
+              // Alias mode: materialise a catalog model and redirect it.
+              draft.modelID = baseModel
+              draft.name = `Local: ${model.name}`
+              draft.settings = { ...(draft.settings ?? {}), baseURL: endpointUrl(baseURL) }
+              draft.body = { ...(draft.body ?? {}), model: model.modelID }
+            }
             draft.limit = { context: model.limit.context, output: model.limit.output }
             draft.capabilities = model.capabilities
             draft.cost = [{ input: 0, output: 0, cache: { read: 0, write: 0 } }]
@@ -229,7 +235,7 @@ export default {
           })
           published += 1
         }
-        log(`transform replay: published ${published} alias(es) on ${host}`)
+        log(`transform replay: published ${published} model(s) on ${host}`)
       })
     } catch (error) {
       log(`could not register the model transform: ${error}`)
@@ -252,7 +258,7 @@ export default {
       )
 
       await ctx.model.reload()
-      log(`published ${published} alias(es) as ${host}/${prefix}<model>`)
+      log(`published ${published} model(s) as ${host}/${prefix}<model>`)
     }
 
     try {
@@ -273,7 +279,7 @@ export default {
       refreshMs,
     )
 
-    log(`watching ${baseURL} every ${refreshMs} ms (aliases on "${host}")`)
+    log(`watching ${baseURL} every ${refreshMs} ms (models on "${host}")`)
 
     return () => {
       clearInterval(timer)
